@@ -90,6 +90,8 @@ Streamlit UI Update
 
 ### 2.1 生成器架构
 
+#### 整体结构
+
 ```
 Generator (12 Factors)
 ├── Input Layer
@@ -97,33 +99,166 @@ Generator (12 Factors)
 │   ├── Memory: [batch, 3, 64, 64] (optional)
 │   └── Guidance: [batch, 12, 64] (optional, 苏醒后)
 │
-├── 12 Factor Networks (并行)
-│   ├── Factor 1 (刻法勒): MLP [128 → 64 → 64]
-│   ├── Factor 2 (尼卡多利): MLP [128 → 64 → 64]
-│   ├── ...
-│   └── Factor 12 (扎格列斯): MLP [128 → 64 → 64]
+├── 12 Factor Networks (并行，各有差异)
+│   ├── Factor 1-12: 各自独立的小型网络
+│   └── 输出: 12 × [batch, 1, 64, 64]
 │
-├── Fusion Layer
-│   ├── Concatenate: [batch, 12*64] = [batch, 768]
-│   ├── FC: [768 → 1024]
-│   ├── ReLU
-│   └── FC: [1024 → 4*4*256]
+├── Fusion Layer (三层架构)
+│   ├── Layer 1: 因子分组融合
+│   ├── Layer 2: 空间竞争 (Attention)
+│   └── Layer 3: RGB解码
 │
-├── Decoder (Transposed CNN)
-│   ├── Reshape: [batch, 256, 4, 4]
-│   ├── ConvTranspose2d: [256 → 128, 4x4 → 8x8]
-│   ├── BatchNorm + ReLU
-│   ├── ConvTranspose2d: [128 → 64, 8x8 → 16x16]
-│   ├── BatchNorm + ReLU
-│   ├── ConvTranspose2d: [64 → 32, 16x16 → 32x32]
-│   ├── BatchNorm + ReLU
-│   ├── ConvTranspose2d: [32 → 3, 32x32 → 64x64]
-│   └── Tanh (输出范围 [-1, 1])
-│
-└── Memory Fusion (if memory exists)
-    ├── world_new: [batch, 3, 64, 64]
-    ├── world_old: [batch, 3, 64, 64]
-    └── output = 0.7 * world_new + 0.3 * world_old
+└── Post-processing (后处理)
+    ├── 黑潮侵蚀效果叠加
+    └── 德谬歌影响效果叠加 (苏醒后)
+```
+
+#### 12因子网络详细设计
+
+**基础结构**（所有因子共享）：
+```
+Input: [batch, 128] (noise)
+    ↓
+FC: [128 → 256]
+    ↓
+ReLU
+    ↓
+FC: [256 → 512]
+    ↓
+ReLU
+    ↓
+FC: [512 → 64*64]
+    ↓
+Reshape: [batch, 1, 64, 64]
+    ↓
+因子特定激活函数
+    ↓
+Output: [batch, 1, 64, 64]
+```
+
+**12因子的差异化设计**：
+
+| 因子 | 激活函数 | 正则化 | 特殊机制 |
+|------|----------|--------|----------|
+| 雅努斯 | Sigmoid | L2 | 平滑约束 |
+| 塔兰顿 | ReLU | L1 | 稀疏约束 |
+| 欧洛尼斯 | Tanh | - | 强记忆权重 |
+| 吉奥里亚 | ReLU6 | 最小化方差 | - |
+| 法吉娜 | LeakyReLU | L1 | - |
+| 艾格勒 | Softplus | - | 边界清晰约束 |
+| 刻法勒 | ReLU6 | - | 均匀分布约束 |
+| 瑟希斯 | GELU | - | 高频特征约束 |
+| 墨涅塔 | Tanh | 负L2（过拟合） | - |
+| 尼卡多利 | Hardtanh | - | 二值化约束 |
+| 塞纳托斯 | Swish | - | 周期性约束 |
+| 扎格列斯 | 双峰激活 | - | 双峰分布约束 |
+
+**自定义激活函数**：
+
+```python
+# 双峰激活（扎格列斯专用）
+class BimodalActivation(nn.Module):
+    def forward(self, x):
+        # 将输出推向 -1 或 +1
+        return torch.tanh(3 * x)  # 放大后tanh，接近双峰
+```
+
+#### 融合层详细设计
+
+**Layer 1: 因子分组融合**
+
+```
+12个因子 [batch, 12, 64, 64]
+    ↓
+按泰坦分组：
+├── 命运组 (雅努斯、塔兰顿、欧洛尼斯) [batch, 3, 64, 64]
+├── 支柱组 (吉奥里亚、法吉娜、艾格勒) [batch, 3, 64, 64]
+├── 创生组 (刻法勒、瑟希斯、墨涅塔) [batch, 3, 64, 64]
+└── 灾厄组 (尼卡多利、塞纳托斯、扎格列斯) [batch, 3, 64, 64]
+    ↓
+每组通过小型卷积网络融合：
+    Conv2d: [3 → 64, kernel=3, padding=1]
+    BatchNorm + ReLU
+    Conv2d: [64 → 64, kernel=3, padding=1]
+    BatchNorm
+    ↓
+输出: 4 × [batch, 64, 64, 64]
+```
+
+**Layer 2: 空间竞争（Attention）**
+
+```
+4个特征图 [batch, 64, 64, 64] × 4
+    ↓
+为每组计算竞争力分数：
+    Conv2d: [64 → 32, kernel=1]
+    ReLU
+    Conv2d: [32 → 1, kernel=1]
+    ↓
+得到: 4 × [batch, 1, 64, 64]
+    ↓
+Softmax归一化（dim=1）
+    ↓
+竞争权重: [batch, 4, 64, 64]
+    ↓
+加权融合:
+    weighted_sum = Σ(weight_i × feature_i)
+    ↓
+输出: [batch, 64, 64, 64]
+```
+
+**Layer 3: RGB解码**
+
+```
+融合特征 [batch, 64, 64, 64]
+    ↓
+Conv2d: [64 → 32, kernel=3, padding=1]
+    ↓
+ReLU
+    ↓
+Conv2d: [32 → 3, kernel=1]
+    ↓
+Tanh (值域 [-1, 1])
+    ↓
+输出: [batch, 3, 64, 64] (RGB世界图像)
+```
+
+#### 后处理效果叠加
+
+**黑潮侵蚀效果**：
+
+```python
+# 1. 判别器计算侵蚀图
+erosion_map = Discriminator(world_rgb)  # [batch, 1, 64, 64]
+
+# 2. 叠加黑潮效果
+world_rgb = world_rgb * (1 - erosion_map)
+```
+
+**德谬歌影响效果**（苏醒后）：
+
+```python
+if demiurge_awakened:
+    # 1. 德谬歌生成影响力图
+    guidance_strength = Demiurge.get_influence_map(...)  # [batch, 1, 64, 64]
+
+    # 2. 叠加金色光晕
+    golden_color = torch.tensor([1.0, 0.84, 0.0])  # RGB
+    world_rgb = world_rgb + guidance_strength * golden_color.view(1, 3, 1, 1)
+
+    # 3. 裁剪
+    world_rgb = torch.clamp(world_rgb, -1, 1)
+```
+
+#### 记忆融合
+
+```python
+if memory_exists:
+    world_new = generated_world  # [batch, 3, 64, 64]
+    world_old = previous_world   # [batch, 3, 64, 64]
+
+    # 加权融合
+    output = 0.7 * world_new + 0.3 * world_old
 ```
 
 ### 2.2 判别器架构
