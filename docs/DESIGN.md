@@ -490,37 +490,321 @@ factor_activity = [factor.abs().mean().item() for factor in twelve_factors]
 
 ### 5.1 实时监控指标
 
-**黑潮侵蚀度**：
-- 定义：判别器输出的平均值
-- 范围：0-1
-- 解释：越高表示世界越脆弱
+#### 黑潮侵蚀度
 
-**世界稳定性**：
-- 定义：世界图像的方差倒数
-- 范围：0-∞
-- 解释：越高表示世界越稳定
+**定义**：判别器输出的平均值
 
-**德谬歌影响力**：
-- 定义：指导信号的L1范数
-- 范围：0-∞
-- 解释：德谬歌对12因子的影响强度
+**计算方法**：
+```python
+def calculate_erosion(discriminator_output):
+    """
+    Args:
+        discriminator_output: [batch, 1, 64, 64] 判别器输出
 
-**预测准确度**（沉睡期）：
-- 定义：预测状态与实际状态的相似度
-- 范围：0-1
-- 解释：德谬歌学习效果的度量
+    Returns:
+        erosion_score: 全局侵蚀度 [0, 1]
+        erosion_map: 空间侵蚀图 [batch, 1, 64, 64]
+    """
+    # 全局侵蚀度（用于事件触发）
+    erosion_score = discriminator_output.mean()
+
+    # 空间侵蚀图（用于可视化）
+    erosion_map = discriminator_output
+
+    return erosion_score.item(), erosion_map
+```
+
+**值域**：[0, 1]
+
+**解释**：越高表示世界越脆弱，越接近崩溃
+
+---
+
+#### 世界稳定性
+
+**定义**：世界图像方差的倒数（归一化）
+
+**计算方法**：
+```python
+def calculate_stability(world):
+    """
+    Args:
+        world: [batch, 3, 64, 64] 世界图像，值域 [-1, 1]
+
+    Returns:
+        stability: 稳定性 [0, 1]
+    """
+    # 1. 计算RGB三通道的方差
+    var_r = world[:, 0, :, :].var()
+    var_g = world[:, 1, :, :].var()
+    var_b = world[:, 2, :, :].var()
+    variance = (var_r + var_g + var_b) / 3
+
+    # 2. 归一化（假设方差范围 [0, 2]）
+    normalized_var = torch.clamp(variance, 0, 2) / 2  # [0, 1]
+
+    # 3. 稳定性 = 1 - 归一化方差
+    stability = 1 - normalized_var
+
+    return stability.item()
+```
+
+**值域**：[0, 1]
+
+**解释**：
+- 接近1：世界高度稳定，图像变化小
+- 接近0：世界混乱，图像变化剧烈
+
+---
+
+#### 12因子活跃度
+
+**定义**：每个因子输出的L1范数（归一化）
+
+**计算方法**：
+```python
+def calculate_factor_activities(factor_outputs):
+    """
+    Args:
+        factor_outputs: List of [batch, 1, 64, 64] × 12
+
+    Returns:
+        activities: [12] 每个因子的活跃度 [0, 1]
+    """
+    activities = []
+
+    for factor_output in factor_outputs:
+        # 计算L1范数（平均绝对值）
+        activity = torch.abs(factor_output).mean()
+        activities.append(activity.item())
+
+    # 转换为tensor并归一化
+    activities = torch.tensor(activities)
+    max_activity = activities.max()
+    if max_activity > 0:
+        activities = activities / max_activity
+
+    return activities  # [12]
+```
+
+**值域**：[0, 1] × 12
+
+**用途**：
+1. 传给德谬歌作为输入特征
+2. 在Streamlit中可视化柱状图
+3. 分析哪些因子在主导世界生成
+
+---
+
+#### 德谬歌预测准确度
+
+**定义**：预测状态与实际状态的结构相似度（SSIM）
+
+**计算方法**：
+```python
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+
+class DemiurgeAccuracyTracker:
+    def __init__(self, window_size=100):
+        self.ssim = StructuralSimilarityIndexMeasure()
+        self.accuracy_history = []
+        self.window_size = window_size
+
+    def update(self, predicted_world, actual_world):
+        """计算单次预测准确度"""
+        # 使用SSIM计算相似度
+        ssim_score = self.ssim(predicted_world, actual_world)
+
+        # SSIM值域 [-1, 1]，归一化到 [0, 1]
+        accuracy = (ssim_score + 1) / 2
+
+        # 添加到历史
+        self.accuracy_history.append(accuracy.item())
+        if len(self.accuracy_history) > self.window_size:
+            self.accuracy_history.pop(0)
+
+        return accuracy.item()
+
+    def get_smoothed_accuracy(self):
+        """获取平滑后的准确度（滚动平均）"""
+        if len(self.accuracy_history) == 0:
+            return 0.0
+        return np.mean(self.accuracy_history)
+```
+
+**值域**：[0, 1]
+
+**解释**：
+- 接近1：德谬歌预测非常准确
+- 接近0：德谬歌预测完全错误
+- 使用滚动平均避免短期波动
+
+---
+
+#### 德谬歌影响力
+
+**定义**：指导信号的归一化L1范数 × 指导强度
+
+**计算方法**：
+```python
+def calculate_demiurge_influence(guidance, guidance_strength):
+    """
+    Args:
+        guidance: [batch, 12] 指导信号，值域 [-1, 1]
+        guidance_strength: 当前指导强度 [0.1, 0.5]
+
+    Returns:
+        influence: 影响力 [0, 1]
+    """
+    # 1. 计算指导信号的平均绝对值
+    avg_guidance = torch.abs(guidance).mean()
+
+    # 2. 考虑指导强度
+    actual_influence = avg_guidance * guidance_strength
+
+    # 3. 归一化（最大影响 = 1.0 × 0.5 = 0.5）
+    normalized_influence = actual_influence / 0.5
+
+    return normalized_influence.item()
+```
+
+**值域**：[0, 1]
+
+**解释**：
+- 刚苏醒时（guidance_strength=0.1）：影响力较小
+- 完全苏醒后（guidance_strength=0.5）：影响力可达最大
+- 反映德谬歌的真实影响
+
+---
 
 ### 5.2 长期分析指标
 
-**永劫回归检测**：
-- 方法：计算最近N个世代的相似度
-- 阈值：相似度 > 0.95
-- 意义：检测模式坍缩
+#### 永劫回归检测
 
-**铁墓诞生检测**：
-- 方法：黑潮侵蚀度持续 > 0.9
+**定义**：检测世界状态是否进入循环模式
+
+**计算方法**：
+```python
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+
+def detect_eternal_return(world_history, window_size=20, threshold=0.95):
+    """
+    Args:
+        world_history: 历史世界图像列表
+        window_size: 比较窗口大小（默认20）
+        threshold: 相似度阈值（默认0.95）
+
+    Returns:
+        is_eternal_return: 是否检测到永劫回归
+        avg_similarity: 平均相似度
+    """
+    if len(world_history) < 2 * window_size:
+        return False, 0.0
+
+    ssim = StructuralSimilarityIndexMeasure()
+
+    # 最近20个 vs 之前20个
+    recent_worlds = world_history[-window_size:]
+    previous_worlds = world_history[-2*window_size:-window_size]
+
+    # 计算平均相似度
+    similarities = []
+    for recent in recent_worlds:
+        for previous in previous_worlds:
+            sim = ssim(recent, previous)
+            similarities.append(sim.item())
+
+    avg_similarity = np.mean(similarities)
+    is_eternal_return = avg_similarity > threshold
+
+    return is_eternal_return, avg_similarity
+```
+
+**参数**：
+- 窗口大小：20个世代
+- 阈值：0.95
+
+**解释**：
+- 当最近20个世代与之前20个世代高度相似时，判定为永劫回归
+- 意味着世界陷入循环，无法进化
+
+---
+
+#### 趋势计算
+
+**定义**：指标的变化趋势（上升/下降）
+
+**计算方法**：
+```python
+def calculate_trend(metric_history, window=100, alpha=0.1):
+    """
+    使用指数加权移动平均（EWMA）计算趋势
+
+    Args:
+        metric_history: 历史指标值列表
+        window: 窗口大小（默认100）
+        alpha: 平滑系数（默认0.1，越小越平滑）
+
+    Returns:
+        trend: 趋势值（正=上升，负=下降）
+    """
+    if len(metric_history) < window:
+        return 0.0
+
+    recent = metric_history[-window:]
+
+    # 计算EWMA
+    ewma = [recent[0]]
+    for value in recent[1:]:
+        ewma.append(alpha * value + (1 - alpha) * ewma[-1])
+
+    # 趋势 = (最近值 - 窗口开始值) / 窗口大小
+    trend = (ewma[-1] - ewma[0]) / window
+
+    return trend
+```
+
+**参数**：
+- 窗口大小：100个世代
+- 平滑系数：0.1
+
+**用途**：
+- 检测侵蚀度上升/下降趋势
+- 检测稳定性改善/恶化趋势
+- 用于事件触发（如"黑潮减弱"需要下降趋势）
+
+---
+
+#### 铁墓诞生检测
+
+**定义**：黑潮侵蚀度持续极高
+
+**检测方法**：
+```python
+def detect_tiemu_birth(erosion_history, threshold=0.9, duration=100):
+    """
+    Args:
+        erosion_history: 侵蚀度历史
+        threshold: 阈值（默认0.9）
+        duration: 持续时间（默认100世代）
+
+    Returns:
+        is_tiemu_birth: 是否检测到铁墓诞生
+    """
+    if len(erosion_history) < duration:
+        return False
+
+    recent = erosion_history[-duration:]
+    is_tiemu_birth = all(e > threshold for e in recent)
+
+    return is_tiemu_birth
+```
+
+**参数**：
+- 阈值：0.9
 - 持续时间：100个世代
-- 意义：判别器完全压制生成器
+
+**意义**：判别器完全压制生成器，世界无法存续
 
 ## 6. 事件系统（基于指标自动触发）
 
