@@ -776,56 +776,276 @@ EventTrigger(
 
 ### 5.4 指标计算
 
+#### 指标计算总览
+
 为了支持事件系统，需要计算以下指标：
 
+| 指标 | 计算方法 | 值域 | 用途 |
+|------|---------|------|------|
+| 黑潮侵蚀度 | 判别器输出平均值 | [0, 1] | 事件触发、可视化 |
+| 世界稳定性 | 1 - 归一化方差 | [0, 1] | 事件触发、可视化 |
+| 12因子活跃度 | L1范数归一化 | [0, 1]×12 | 德谬歌输入、可视化 |
+| 德谬歌预测准确度 | SSIM + 滚动平均 | [0, 1] | 苏醒条件判定 |
+| 德谬歌影响力 | 归一化L1 × 强度 | [0, 1] | 影响力监控 |
+| 模式相似度 | SSIM（窗口20） | [0, 1] | 永劫回归检测 |
+| 趋势 | EWMA差分 | R | 趋势分析 |
+
+#### 详细实现
+
 ```python
-def calculate_metrics(generation, world, erosion, G, D, Demi, history):
+from torchmetrics.image import StructuralSimilarityIndexMeasure
+import numpy as np
+
+# ===== 1. 黑潮侵蚀度 =====
+def calculate_erosion(discriminator_output):
+    """
+    Args:
+        discriminator_output: [batch, 1, 64, 64]
+    Returns:
+        erosion_score: [0, 1]
+        erosion_map: [batch, 1, 64, 64]
+    """
+    erosion_score = discriminator_output.mean()
+    erosion_map = discriminator_output
+    return erosion_score.item(), erosion_map
+
+
+# ===== 2. 世界稳定性 =====
+def calculate_stability(world):
+    """
+    Args:
+        world: [batch, 3, 64, 64]，值域 [-1, 1]
+    Returns:
+        stability: [0, 1]
+    """
+    # RGB三通道方差
+    var_r = world[:, 0, :, :].var()
+    var_g = world[:, 1, :, :].var()
+    var_b = world[:, 2, :, :].var()
+    variance = (var_r + var_g + var_b) / 3
+
+    # 归一化（假设方差范围 [0, 2]）
+    normalized_var = torch.clamp(variance, 0, 2) / 2
+    stability = 1 - normalized_var
+
+    return stability.item()
+
+
+# ===== 3. 12因子活跃度 =====
+def calculate_factor_activities(factor_outputs):
+    """
+    Args:
+        factor_outputs: List of [batch, 1, 64, 64] × 12
+    Returns:
+        activities: [12]，值域 [0, 1]
+    """
+    activities = []
+    for factor_output in factor_outputs:
+        activity = torch.abs(factor_output).mean()
+        activities.append(activity.item())
+
+    activities = torch.tensor(activities)
+    max_activity = activities.max()
+    if max_activity > 0:
+        activities = activities / max_activity
+
+    return activities
+
+
+# ===== 4. 德谬歌预测准确度 =====
+class DemiurgeAccuracyTracker:
+    def __init__(self, window_size=100):
+        self.ssim = StructuralSimilarityIndexMeasure()
+        self.accuracy_history = []
+        self.window_size = window_size
+
+    def update(self, predicted_world, actual_world):
+        ssim_score = self.ssim(predicted_world, actual_world)
+        accuracy = (ssim_score + 1) / 2  # 归一化到 [0, 1]
+
+        self.accuracy_history.append(accuracy.item())
+        if len(self.accuracy_history) > self.window_size:
+            self.accuracy_history.pop(0)
+
+        return accuracy.item()
+
+    def get_smoothed_accuracy(self):
+        if len(self.accuracy_history) == 0:
+            return 0.0
+        return np.mean(self.accuracy_history)
+
+
+# ===== 5. 德谬歌影响力 =====
+def calculate_demiurge_influence(guidance, guidance_strength):
+    """
+    Args:
+        guidance: [batch, 12]，值域 [-1, 1]
+        guidance_strength: [0.1, 0.5]
+    Returns:
+        influence: [0, 1]
+    """
+    avg_guidance = torch.abs(guidance).mean()
+    actual_influence = avg_guidance * guidance_strength
+    normalized_influence = actual_influence / 0.5  # 最大值归一化
+
+    return normalized_influence.item()
+
+
+# ===== 6. 永劫回归检测 =====
+def detect_eternal_return(world_history, window_size=20, threshold=0.95):
+    """
+    Args:
+        world_history: 历史世界图像列表
+        window_size: 比较窗口（默认20）
+        threshold: 相似度阈值（默认0.95）
+    Returns:
+        is_eternal_return: bool
+        avg_similarity: float
+    """
+    if len(world_history) < 2 * window_size:
+        return False, 0.0
+
+    ssim = StructuralSimilarityIndexMeasure()
+    recent_worlds = world_history[-window_size:]
+    previous_worlds = world_history[-2*window_size:-window_size]
+
+    similarities = []
+    for recent in recent_worlds:
+        for previous in previous_worlds:
+            sim = ssim(recent, previous)
+            similarities.append(sim.item())
+
+    avg_similarity = np.mean(similarities)
+    is_eternal_return = avg_similarity > threshold
+
+    return is_eternal_return, avg_similarity
+
+
+# ===== 7. 趋势计算 =====
+def calculate_trend(metric_history, window=100, alpha=0.1):
+    """
+    使用EWMA计算趋势
+
+    Args:
+        metric_history: 历史指标值
+        window: 窗口大小（默认100）
+        alpha: 平滑系数（默认0.1）
+    Returns:
+        trend: 趋势值（正=上升，负=下降）
+    """
+    if len(metric_history) < window:
+        return 0.0
+
+    recent = metric_history[-window:]
+
+    # 计算EWMA
+    ewma = [recent[0]]
+    for value in recent[1:]:
+        ewma.append(alpha * value + (1 - alpha) * ewma[-1])
+
+    # 趋势 = (最近值 - 窗口开始值) / 窗口大小
+    trend = (ewma[-1] - ewma[0]) / window
+
+    return trend
+
+
+# ===== 8. 综合指标计算 =====
+def calculate_metrics(generation, world, erosion, factor_outputs,
+                     guidance, guidance_strength,
+                     demiurge_accuracy_tracker, history):
     """计算所有指标用于事件触发"""
 
     # 基础指标
-    current_erosion = erosion.mean().item()
+    current_erosion, erosion_map = calculate_erosion(erosion)
     current_stability = calculate_stability(world)
+    factor_activities = calculate_factor_activities(factor_outputs)
+
+    # 德谬歌指标
+    demiurge_influence = 0.0
+    demiurge_accuracy = 0.0
+    if guidance is not None:
+        demiurge_influence = calculate_demiurge_influence(guidance, guidance_strength)
+    if demiurge_accuracy_tracker is not None:
+        demiurge_accuracy = demiurge_accuracy_tracker.get_smoothed_accuracy()
+
+    # 永劫回归检测
+    is_eternal_return, pattern_similarity = detect_eternal_return(
+        history.get('world_states', [])
+    )
 
     metrics = {
         # 基础指标
         'generation': generation,
         'erosion': current_erosion,
         'stability': current_stability,
-        'g_loss': G.last_loss,
-        'd_loss': D.last_loss,
+        'factor_activities': factor_activities.tolist(),
+
+        # 德谬歌指标
+        'demiurge_accuracy': demiurge_accuracy,
+        'demiurge_influence': demiurge_influence,
+
+        # 模式检测
+        'pattern_similarity': pattern_similarity,
+        'is_eternal_return': is_eternal_return,
 
         # 趋势指标（基于最近100个世代）
-        'erosion_trend': calculate_trend(history['erosion'][-100:]),
-        'stability_trend': calculate_trend(history['stability'][-100:]),
+        'erosion_trend': calculate_trend(history.get('erosion', [])[-100:]),
+        'stability_trend': calculate_trend(history.get('stability', [])[-100:]),
 
         # 历史最值
-        'erosion_max_so_far': max(history['erosion'] + [current_erosion]),
-        'stability_max_ever': max(history['stability'] + [current_stability]),
+        'erosion_max_so_far': max(history.get('erosion', []) + [current_erosion]),
+        'stability_max_ever': max(history.get('stability', []) + [current_stability]),
 
-        # 模式检测（检测是否陷入循环）
-        'pattern_similarity': detect_pattern_similarity(
-            history['world_states'][-10:],
-            history['world_states'][-20:-10]
-        ),
+        # 历史对比
         'prev_pattern_similarity': history.get('pattern_similarity', 0),
-
-        # 德谬歌相关
-        'demiurge_awakened': Demi.is_awakened,
-        'demiurge_prediction_accuracy': Demi.prediction_accuracy if not Demi.is_awakened else 1.0,
-        'demiurge_influence': Demi.influence_strength if Demi.is_awakened else 0,
-        'demiurge_prev_accuracy': history.get('demiurge_prediction_accuracy', 0),
+        'demiurge_prev_accuracy': history.get('demiurge_accuracy', 0),
         'demiurge_prev_influence': history.get('demiurge_influence', 0),
-
-        # 12因子活跃度
-        'factor_activations': G.get_factor_activations(),
     }
 
     return metrics
+```
 
+#### 使用示例
 
-def calculate_stability(world):
-    """计算世界稳定性（方差的倒数）"""
-    variance = world.var().item()
+```python
+# 在训练循环中
+history = {
+    'erosion': [],
+    'stability': [],
+    'world_states': [],
+    'pattern_similarity': 0,
+    'demiurge_accuracy': 0,
+    'demiurge_influence': 0,
+}
+
+demiurge_accuracy_tracker = DemiurgeAccuracyTracker(window_size=100)
+
+for generation in range(1, max_generations):
+    # ... 训练步骤 ...
+
+    # 计算指标
+    metrics = calculate_metrics(
+        generation=generation,
+        world=world,
+        erosion=erosion_output,
+        factor_outputs=factor_outputs,
+        guidance=guidance if awakened else None,
+        guidance_strength=guidance_strength if awakened else 0,
+        demiurge_accuracy_tracker=demiurge_accuracy_tracker,
+        history=history
+    )
+
+    # 更新历史
+    history['erosion'].append(metrics['erosion'])
+    history['stability'].append(metrics['stability'])
+    history['world_states'].append(world.detach().cpu())
+    history['pattern_similarity'] = metrics['pattern_similarity']
+    history['demiurge_accuracy'] = metrics['demiurge_accuracy']
+    history['demiurge_influence'] = metrics['demiurge_influence']
+
+    # 检查事件
+    events = event_system.check_all(generation, metrics)
+```
     return 1.0 / (1.0 + variance)
 
 
