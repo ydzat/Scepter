@@ -1,0 +1,214 @@
+# Scepter 项目配置模板
+# 复制此文件为 config.yaml 并根据需要修改
+
+# 实验基本配置
+experiment:
+  name: "scepter_experiment_001"
+  description: "权杖δ-me13模拟实验"
+  seed: 42
+  device: "cuda"  # cuda, cpu, mps
+  
+# 训练配置
+training:
+  total_generations: 50000
+  batch_size: 16
+  
+  # 阶段配置
+  phases:
+    dormant_period:
+      start: 1
+      end: 9999
+      description: "德谬歌沉睡期"
+    
+    awakened_period:
+      start: 10000
+      end: 50000
+      description: "德谬歌苏醒期"
+  
+  # 学习率
+  learning_rate:
+    generator: 0.0002
+    discriminator: 0.0002
+    demiurge: 0.0001
+  
+  # 优化器参数
+  optimizer:
+    type: "Adam"
+    betas: [0.5, 0.999]
+  
+  # 损失函数
+  loss:
+    type: "BCELoss"  # Binary Cross Entropy
+
+# 网络架构配置
+networks:
+  # 生成器（12因子）
+  generator:
+    noise_dim: 128
+    factor_hidden_dim: 64
+    num_factors: 12
+    output_size: [64, 64]
+    output_channels: 3
+    memory_weight: 0.3  # 记忆融合权重
+    guidance_weight: 0.3  # 德谬歌指导权重（苏醒后）
+  
+  # 判别器（黑潮）
+  discriminator:
+    input_size: [64, 64]
+    input_channels: 3
+    dropout: 0.3
+  
+  # 观察者（德谬歌）
+  demiurge:
+    world_encoding_dim: 512
+    memory_hidden_dim: 256
+    memory_num_layers: 2
+    guidance_dim: 64
+    history_length: 10  # LSTM观察的历史长度
+    awaken_generation: 10000  # 苏醒世代
+
+# 12个因子配置
+factors:
+  - name: "刻法勒"
+    trait: "憎恨"
+    path: "毁灭"
+    description: "负世之泰坦"
+  
+  - name: "尼卡多利"
+    trait: "约束"
+    path: "巡猎"
+    description: "纷争之泰坦"
+  
+  - name: "塞纳托斯"
+    trait: "平和"
+    path: "均衡"
+    description: "死亡之泰坦"
+  
+  - name: "欧洛尼斯"
+    trait: "哀怜"
+    path: "记忆"
+    description: "岁月之泰坦"
+  
+  - name: "塔兰顿"
+    trait: "支配"
+    path: "秩序"
+    description: "律法之泰坦"
+  
+  - name: "雅努斯"
+    trait: "同理"
+    path: "同谐"
+    description: "门径之泰坦"
+  
+  - name: "吉奥里亚"
+    trait: "求存"
+    path: "不朽"
+    description: "大地之泰坦"
+  
+  - name: "法吉娜"
+    trait: "自否"
+    path: "虚无"
+    description: "海洋之泰坦"
+  
+  - name: "艾格勒"
+    trait: "奉献"
+    path: "存护"
+    description: "天空之泰坦"
+  
+  - name: "瑟希斯"
+    trait: "批判"
+    path: "智识"
+    description: "理性之泰坦"
+  
+  - name: "墨涅塔"
+    trait: "节制"
+    path: "纯美"
+    description: "浪漫之泰坦"
+  
+  - name: "扎格列斯"
+    trait: "渴望"
+    path: "欢愉"
+    description: "诡计之泰坦"
+
+# 事件系统配置
+events:
+  preset:
+    1: "实验开始：12因子初始化"
+    1000: "黑潮首次爆发"
+    5000: "检测到永劫回归迹象"
+    10000: "🌟 德谬歌苏醒"
+    15000: "德谬歌影响力达到50%"
+    20000: "世界稳定性首次超过黑潮"
+    33550336: "🎯 对应游戏剧情的世代数"
+    50000: "实验结束：计算生命第一因"
+  
+  dynamic:
+    black_tide_outbreak:
+      condition: "erosion > 0.8"
+      message: "⚠️ 黑潮爆发"
+    
+    civilization_leap:
+      condition: "stability > 0.9"
+      message: "✨ 文明跃迁"
+    
+    eternal_return:
+      condition: "loop_detected"
+      message: "🔄 永劫回归"
+    
+    iron_tomb_birth:
+      condition: "erosion > 0.9 for 100 generations"
+      message: "💀 铁墓诞生"
+
+# 可视化配置
+visualization:
+  enabled: true
+  update_interval: 10  # 每N个世代更新一次
+  
+  display:
+    window_size: [1920, 1080]
+    world_display_size: [512, 512]
+    fps: 30
+  
+  plots:
+    - type: "line"
+      name: "黑潮侵蚀度"
+      metric: "erosion"
+      color: "red"
+    
+    - type: "line"
+      name: "世界稳定性"
+      metric: "stability"
+      color: "green"
+    
+    - type: "line"
+      name: "德谬歌影响力"
+      metric: "demiurge_influence"
+      color: "gold"
+    
+    - type: "bar"
+      name: "12因子活跃度"
+      metric: "factor_activations"
+
+# 检查点配置
+checkpoint:
+  enabled: true
+  save_interval: 1000  # 每N个世代保存一次
+  keep_last_n: 5  # 保留最近N个检查点
+  save_path: "experiments/checkpoints"
+
+# 日志配置
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  save_to_file: true
+  log_dir: "experiments/logs"
+  
+  tensorboard:
+    enabled: true
+    log_dir: "experiments/tensorboard"
+
+# 数据记录配置
+recording:
+  save_world_images: false  # 是否保存每个世代的世界图像（占用空间大）
+  save_metrics: true
+  metrics_format: "csv"  # csv, json
+  metrics_path: "experiments/metrics"
+
