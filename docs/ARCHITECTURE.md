@@ -288,7 +288,22 @@ Discriminator (Black Tide)
 └── Output: Erosion Score (黑潮侵蚀度)
 ```
 
-### 2.3 观察者架构
+### 2.3 观察者架构（德谬歌）
+
+#### 设计理念
+
+**德谬歌的本质**：
+- 原动力：爱（游戏设定）
+- 作用：通过"记忆"的力量影响世界
+- 学习内容：记忆12因子的协作模式，理解因果关系
+
+**学习目标**：
+1. 记忆哪些因子组合能产生稳定的世界
+2. 预测世界的演化（理解因果）
+3. 识别永劫回归（循环模式）
+4. 苏醒后提醒12因子调整
+
+#### 网络结构
 
 ```
 Observer (Demiurge)
@@ -301,28 +316,71 @@ Observer (Demiurge)
 │   ├── Conv2d: [128 → 256, 16x16 → 8x8]
 │   ├── ReLU
 │   ├── Flatten: [batch, 256*8*8]
-│   ├── FC: [256*8*8 → 512]
-│   └── Output: [batch, 512] (世界编码)
+│   ├── FC: [256*8*8 → 256]
+│   └── Output: [batch, 256] (世界特征)
+│
+├── Factor Encoder
+│   ├── Input: [batch, 12] (12因子活跃度)
+│   ├── FC: [12 → 64]
+│   └── Output: [batch, 64] (因子特征)
 │
 ├── Memory Module (LSTM)
-│   ├── Input: [batch, seq_len, 512]
-│   ├── LSTM: hidden_size=256, num_layers=2
-│   └── Output: [batch, 256] (记忆状态)
+│   ├── Input: [batch, 320] (256世界 + 64因子)
+│   ├── LSTM: hidden_size=512, num_layers=2
+│   └── Output: [batch, 512] (记忆状态)
 │
-├── Predictor (沉睡期使用)
-│   ├── Input: [batch, 256]
-│   ├── FC: [256 → 512]
+├── Predictor (沉睡期训练)
+│   ├── Input: [batch, 512]
+│   ├── FC: [512 → 256]
 │   ├── ReLU
-│   ├── FC: [512 → 512]
-│   └── Output: [batch, 512] (预测的下一个世界编码)
+│   ├── FC: [256 → 3*64*64]
+│   ├── Tanh
+│   └── Output: [batch, 3, 64, 64] (预测的下一个世界)
 │
-└── Guide Generator (苏醒期使用)
-    ├── Input: [batch, 256]
-    ├── FC: [256 → 512]
+└── Advisor (苏醒期使用)
+    ├── Input: [batch, 512]
+    ├── FC: [512 → 128]
     ├── ReLU
-    ├── FC: [512 → 12*64]
-    ├── Reshape: [batch, 12, 64]
-    └── Output: [batch, 12, 64] (对12因子的指导)
+    ├── FC: [128 → 12]
+    ├── Tanh
+    └── Output: [batch, 12] (对12因子的调整建议)
+```
+
+#### 指导机制
+
+**指导信号形式**：
+- 输出：`[batch, 12]` 全局调整向量
+- 每个因子一个标量
+- 正值：建议增强该因子
+- 负值：建议抑制该因子
+- 值域：[-1, 1]
+
+**指导信号注入**：乘法调制
+
+```python
+# 1. 德谬歌生成调整建议
+guidance = Demiurge.generate_guidance(world, factor_activities)  # [batch, 12]
+
+# 2. 计算调制系数
+guidance_strength = 0.5  # 可配置
+adjustment = 1.0 + guidance_strength * guidance  # 范围 [0.5, 1.5]
+
+# 3. 调制因子输出
+for i in range(12):
+    factor_outputs[i] = factor_outputs[i] * adjustment[:, i].view(-1, 1, 1, 1)
+```
+
+**效果**：
+- `guidance[i] = +1.0` → `adjustment[i] = 1.5` → 因子增强50%
+- `guidance[i] = -1.0` → `adjustment[i] = 0.5` → 因子抑制50%
+- `guidance[i] = 0.0` → `adjustment[i] = 1.0` → 因子不变
+
+**指导强度控制**：渐进式增强
+
+```python
+# 刚苏醒时影响较小，逐渐增强
+progress = (generation - awakening_generation) / 5000
+guidance_strength = 0.1 + 0.4 * min(progress, 1.0)  # 从0.1增强到0.5
 ```
 
 ## 3. 训练流程
