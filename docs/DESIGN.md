@@ -118,7 +118,12 @@
 **结构**：
 - 标准CNN判别器
 - 输入：64x64 RGB图像
-- 输出：单一标量（侵蚀强度）
+- 输出：空间侵蚀图 `[batch, 1, 64, 64]`，值域 [0, 1]
+
+**输出说明**：
+- 判别器输出空间侵蚀图，每个像素表示该位置的侵蚀强度
+- 全局侵蚀度 = 空间侵蚀图的平均值
+- 保留空间信息用于可视化黑潮效果
 
 **训练目标**：
 - 识别生成的世界（标签为0）
@@ -252,38 +257,64 @@ guidance_strength = 0.1 + 0.4 * min(progress, 1.0)  # 从0.1增强到0.5
 
 ```python
 for generation in range(1, 10000):
-    # 1. 生成世界（标准GAN）
-    noise = random_noise()
-    world = Generator(noise, previous_world)
+    # 1. 生成噪声
+    noise = random_noise()  # [batch, noise_dim]
 
-    # 2. 计算12因子活跃度
+    # 2. 12因子各自生成特征图
+    factor_outputs = [factor_i(noise) for i in range(12)]  # List of [batch, 1, 64, 64]
+
+    # 3. 融合层生成世界
+    world_new = FusionLayer(factor_outputs)  # [batch, 3, 64, 64]
+
+    # 4. 记忆融合（与上一世代混合）
+    if previous_world is not None:
+        world = 0.7 * world_new + 0.3 * previous_world
+    else:
+        world = world_new
+
+    # 5. 计算12因子活跃度
     factor_activities = torch.tensor([
-        factor.abs().mean().item() for factor in twelve_factors
+        factor.abs().mean().item() for factor in factor_outputs
     ])  # [12]
 
-    # 3. 判别器判断
-    erosion = Discriminator(world)
+    # 6. 判别器判断
+    erosion = Discriminator(world)  # [batch, 1, 64, 64]
 
-    # 4. 德谬歌观察并学习（独立训练）
+    # 7. 德谬歌观察并学习（独立训练）
     predicted_world = Demiurge.observe_and_learn(
         world.detach(),
         factor_activities
     )
 
-    # 5. 德谬歌的学习损失（预测下一个世界）
-    next_world = Generator(random_noise(), world.detach())
+    # 8. 德谬歌的学习损失（预测下一个世界）
+    next_world_noise = random_noise()
+    next_factor_outputs = [factor_i(next_world_noise) for i in range(12)]
+    next_world_new = FusionLayer(next_factor_outputs)
+    next_world = 0.7 * next_world_new + 0.3 * world.detach()
+
     demiurge_loss = F.mse_loss(predicted_world, next_world.detach())
 
-    # 6. 训练德谬歌（不影响G/D）
+    # 9. 训练德谬歌（不影响G/D）
     demiurge_optimizer.zero_grad()
     demiurge_loss.backward()
     demiurge_optimizer.step()
 
-    # 7. 标准GAN训练
-    D_loss = train_discriminator(world, erosion)
-    G_loss = train_generator(world, erosion)
+    # 10. 标准GAN训练
+    D_loss = discriminator_loss_wgan_gp(D, real_world, world)
+    G_loss_adv = generator_loss_wgan(D, world)
+    G_loss_reg = factor_regularization_loss(factor_outputs, factor_configs)
+    G_loss = G_loss_adv + 0.01 * G_loss_reg
 
-    # 8. 保存记忆
+    # 11. 优化器步骤
+    D_optimizer.zero_grad()
+    D_loss.backward()
+    D_optimizer.step()
+
+    G_optimizer.zero_grad()
+    G_loss.backward()
+    G_optimizer.step()
+
+    # 12. 保存记忆
     previous_world = world.detach()
 ```
 
@@ -291,48 +322,265 @@ for generation in range(1, 10000):
 
 ```python
 for generation in range(10000, 50000):
-    # 1. 计算当前因子活跃度
-    factor_activities = torch.tensor([
-        factor.abs().mean().item() for factor in twelve_factors
-    ])  # [12]
-
-    # 2. 德谬歌生成指导
+    # 1. 德谬歌生成指导（基于上一世代）
     guidance = Demiurge.generate_guidance(
         previous_world,
-        factor_activities
+        previous_factor_activities
     )  # [batch, 12]
 
-    # 3. 计算指导强度（渐进式）
+    # 2. 计算指导强度（渐进式）
     progress = (generation - 10000) / 5000
     guidance_strength = 0.1 + 0.4 * min(progress, 1.0)  # 0.1 → 0.5
 
-    # 4. 生成世界（受指导影响）
+    # 3. 生成噪声
     noise = random_noise()
 
-    # 4.1 12因子各自生成
+    # 4. 12因子各自生成
     factor_outputs = [factor_i(noise) for i in range(12)]
 
-    # 4.2 应用德谬歌的指导（乘法调制）
+    # 5. 应用德谬歌的指导（乘法调制）
     adjustment = 1.0 + guidance_strength * guidance  # [batch, 12]
     for i in range(12):
         factor_outputs[i] = factor_outputs[i] * adjustment[:, i].view(-1, 1, 1, 1)
 
-    # 4.3 融合
-    world = FusionLayer(factor_outputs, previous_world)
+    # 6. 融合层生成世界
+    world_new = FusionLayer(factor_outputs)  # [batch, 3, 64, 64]
 
-    # 5. 判别器判断
-    erosion = Discriminator(world)
+    # 7. 记忆融合
+    if previous_world is not None:
+        world = 0.7 * world_new + 0.3 * previous_world
+    else:
+        world = world_new
 
-    # 6. 继续GAN训练
-    D_loss = train_discriminator(world, erosion)
-    G_loss = train_generator(world, erosion)
+    # 8. 计算12因子活跃度
+    factor_activities = torch.tensor([
+        factor.abs().mean().item() for factor in factor_outputs
+    ])  # [12]
 
-    # 7. 德谬歌继续观察（不训练）
+    # 9. 判别器判断
+    erosion = Discriminator(world)  # [batch, 1, 64, 64]
+
+    # 10. 继续GAN训练
+    D_loss = discriminator_loss_wgan_gp(D, real_world, world)
+    G_loss_adv = generator_loss_wgan(D, world)
+    G_loss_reg = factor_regularization_loss(factor_outputs, factor_configs)
+    G_loss = G_loss_adv + 0.01 * G_loss_reg
+
+    # 11. 优化器步骤
+    D_optimizer.zero_grad()
+    D_loss.backward()
+    D_optimizer.step()
+
+    G_optimizer.zero_grad()
+    G_loss.backward()
+    G_optimizer.step()
+
+    # 12. 德谬歌继续观察（不训练）
     with torch.no_grad():
         Demiurge.observe_and_learn(world.detach(), factor_activities)
 
-    # 8. 保存记忆
+    # 13. 保存记忆
     previous_world = world.detach()
+    previous_factor_activities = factor_activities
+```
+
+### 3.3 损失函数详细定义
+
+#### 判别器损失
+
+**标准GAN损失**（Binary Cross Entropy）：
+
+```python
+def discriminator_loss(D, real_world, fake_world):
+    """
+    Args:
+        D: 判别器
+        real_world: 真实世界图像（如果有）或目标分布
+        fake_world: 生成器生成的世界
+
+    Returns:
+        loss: 判别器损失
+    """
+    # 真实世界的侵蚀图（目标：全0，表示无侵蚀）
+    real_erosion = D(real_world)
+    real_target = torch.zeros_like(real_erosion)
+
+    # 生成世界的侵蚀图（目标：全1，表示完全侵蚀）
+    fake_erosion = D(fake_world.detach())
+    fake_target = torch.ones_like(fake_erosion)
+
+    # BCE损失
+    loss_real = F.binary_cross_entropy(real_erosion, real_target)
+    loss_fake = F.binary_cross_entropy(fake_erosion, fake_target)
+
+    loss = (loss_real + loss_fake) / 2
+
+    return loss
+```
+
+**注意**：
+- 在本项目中，我们没有"真实世界"数据集
+- 可以使用以下策略之一：
+  - **策略A**：判别器只判断生成世界，目标是最大化侵蚀度
+  - **策略B**：使用预定义的"理想世界"模板作为真实数据
+  - **策略C**：使用WGAN-GP损失（推荐）
+
+**推荐：WGAN-GP损失**
+
+```python
+def discriminator_loss_wgan_gp(D, real_world, fake_world, lambda_gp=10):
+    """
+    WGAN-GP损失（Wasserstein GAN with Gradient Penalty）
+
+    Args:
+        D: 判别器
+        real_world: 真实世界（或理想模板）
+        fake_world: 生成世界
+        lambda_gp: 梯度惩罚系数
+
+    Returns:
+        loss: 判别器损失
+    """
+    # Wasserstein距离
+    real_erosion = D(real_world).mean()
+    fake_erosion = D(fake_world.detach()).mean()
+
+    # 梯度惩罚
+    alpha = torch.rand(real_world.size(0), 1, 1, 1).to(real_world.device)
+    interpolates = alpha * real_world + (1 - alpha) * fake_world
+    interpolates.requires_grad_(True)
+
+    d_interpolates = D(interpolates)
+    gradients = torch.autograd.grad(
+        outputs=d_interpolates,
+        inputs=interpolates,
+        grad_outputs=torch.ones_like(d_interpolates),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+
+    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+
+    loss = fake_erosion - real_erosion + lambda_gp * gradient_penalty
+
+    return loss
+```
+
+#### 生成器损失
+
+```python
+def generator_loss(D, fake_world):
+    """
+    生成器损失：欺骗判别器
+
+    Args:
+        D: 判别器
+        fake_world: 生成的世界
+
+    Returns:
+        loss: 生成器损失
+    """
+    # 生成器希望判别器输出低侵蚀度（接近0）
+    fake_erosion = D(fake_world)
+    target = torch.zeros_like(fake_erosion)
+
+    loss = F.binary_cross_entropy(fake_erosion, target)
+
+    return loss
+```
+
+**WGAN-GP版本**：
+
+```python
+def generator_loss_wgan(D, fake_world):
+    """
+    WGAN生成器损失
+    """
+    fake_erosion = D(fake_world).mean()
+    loss = -fake_erosion  # 最大化判别器输出（负号转为最小化）
+
+    return loss
+```
+
+#### 德谬歌损失（沉睡期）
+
+```python
+def demiurge_loss(Demiurge, current_world, factor_activities, next_world):
+    """
+    德谬歌的自监督学习损失
+
+    Args:
+        Demiurge: 德谬歌网络
+        current_world: 当前世界状态
+        factor_activities: 12因子活跃度
+        next_world: 下一个世界状态（真实值）
+
+    Returns:
+        loss: 预测损失
+    """
+    # 预测下一个世界
+    predicted_world = Demiurge.predict(
+        current_world.detach(),
+        factor_activities.detach()
+    )
+
+    # MSE损失
+    loss = F.mse_loss(predicted_world, next_world.detach())
+
+    return loss
+```
+
+#### 12因子的正则化损失
+
+```python
+def factor_regularization_loss(factor_outputs, factor_configs):
+    """
+    12因子的正则化损失
+
+    Args:
+        factor_outputs: List of [batch, 1, 64, 64] × 12
+        factor_configs: 每个因子的正则化配置
+
+    Returns:
+        reg_loss: 正则化损失
+    """
+    reg_loss = 0.0
+
+    for i, (output, config) in enumerate(zip(factor_outputs, factor_configs)):
+        if config['regularization'] == 'L1':
+            reg_loss += config['reg_weight'] * output.abs().mean()
+
+        elif config['regularization'] == 'L2':
+            reg_loss += config['reg_weight'] * (output ** 2).mean()
+
+        elif config['regularization'] == 'negative_L2':
+            # 负L2：鼓励大值（墨涅塔的过拟合）
+            reg_loss -= config['reg_weight'] * (output ** 2).mean()
+
+        elif config['regularization'] == 'variance_min':
+            # 方差最小化：鼓励均匀（吉奥里亚的稳定）
+            reg_loss += config['reg_weight'] * output.var()
+
+        elif config['regularization'] == 'sparsity':
+            # 稀疏性：鼓励大部分为0（法吉娜的虚无）
+            reg_loss += config['reg_weight'] * (output.abs() > 0.1).float().mean()
+
+    return reg_loss
+```
+
+#### 总损失
+
+```python
+# 判别器训练步骤
+D_loss = discriminator_loss_wgan_gp(D, real_world, fake_world)
+
+# 生成器训练步骤
+G_loss_adversarial = generator_loss_wgan(D, fake_world)
+G_loss_regularization = factor_regularization_loss(factor_outputs, factor_configs)
+G_loss = G_loss_adversarial + 0.01 * G_loss_regularization  # 正则化权重
+
+# 德谬歌训练步骤（沉睡期）
+Demi_loss = demiurge_loss(Demiurge, current_world, factor_activities, next_world)
 ```
 
 ## 4. 世界状态表示
@@ -407,16 +655,22 @@ world_rgb = world_rgb * (1 - erosion_map)
 
 ```python
 if demiurge_awakened:
-    # 1. 德谬歌生成影响力图
-    guidance_strength = Demiurge.get_influence_map(...)  # [batch, 1, 64, 64]
+    # 1. 计算德谬歌的全局影响力（标量）
+    demiurge_influence = calculate_demiurge_influence(guidance, guidance_strength)
+    # demiurge_influence: [0, 1]
 
-    # 2. 叠加金色光晕
+    # 2. 叠加全局金色滤镜
     golden_color = torch.tensor([1.0, 0.84, 0.0])  # 金色 RGB
-    world_rgb = world_rgb + guidance_strength * golden_color.view(1, 3, 1, 1)
+    world_rgb = world_rgb + demiurge_influence * golden_color.view(1, 3, 1, 1)
 
     # 3. 裁剪到[-1, 1]
     world_rgb = torch.clamp(world_rgb, -1, 1)
 ```
+
+**说明**：
+- 德谬歌的影响是全局性的，不是空间性的
+- 影响力越强，整个世界图像越偏向金色
+- 这符合德谬歌"爱"的原动力——普照一切
 
 ### 4.3 可视化方案
 
@@ -831,6 +1085,8 @@ def detect_tiemu_birth(erosion_history, threshold=0.9, duration=100):
 **德谬歌相关**：
 - 学习进度里程碑：预测准确度 > 0.8
 - 德谬歌苏醒：准确度 > 0.9 且侵蚀度 > 0.75 且世代 > 5000
+  - **说明**：世代 > 5000 是为了确保德谬歌有足够的训练时间
+  - 这是唯一包含硬编码世代数的事件，其他事件完全基于指标
 - 影响力增强：影响力 > 0.5
 
 **终极事件**：
@@ -845,7 +1101,232 @@ def detect_tiemu_birth(erosion_history, threshold=0.9, duration=100):
 - 优先级2（🟢）：平衡、稳定
 - 优先级1（⚪）：世代里程碑
 
-## 7. 技术栈
+## 7. 超参数配置
+
+### 7.1 网络架构参数
+
+#### 生成器（12因子）
+
+```yaml
+generator:
+  # 噪声输入
+  noise_dim: 128
+
+  # 12因子基础网络
+  factor_base_network:
+    input_dim: 128
+    hidden_dims: [256, 512, 1024]
+    output_shape: [1, 64, 64]
+
+  # 融合层
+  fusion_layer:
+    # 第一层：分组融合
+    group_fusion_channels: 64
+
+    # 第二层：空间竞争
+    attention_heads: 4
+
+    # 第三层：RGB解码
+    decoder_channels: [64, 32, 3]
+
+  # 记忆融合
+  memory_fusion:
+    new_weight: 0.7
+    old_weight: 0.3
+```
+
+#### 判别器（黑潮）
+
+```yaml
+discriminator:
+  # CNN架构
+  channels: [3, 64, 128, 256, 512]
+  kernel_sizes: [4, 4, 4, 4]
+  strides: [2, 2, 2, 2]
+
+  # 输出层（保留空间信息）
+  output_channels: 1
+  output_activation: 'sigmoid'
+```
+
+#### 德谬歌（观察者）
+
+```yaml
+demiurge:
+  # 世界编码器
+  world_encoder:
+    input_channels: 3
+    output_dim: 256
+
+  # 因子编码器
+  factor_encoder:
+    input_dim: 12
+    output_dim: 64
+
+  # 记忆模块（LSTM）
+  memory:
+    input_size: 320  # 256 + 64
+    hidden_size: 512
+    num_layers: 2
+    dropout: 0.1
+
+  # 预测器（沉睡期）
+  predictor:
+    hidden_dims: [512, 256]
+    output_dim: 12288  # 3 * 64 * 64
+
+  # 建议器（苏醒期）
+  advisor:
+    hidden_dims: [512, 128]
+    output_dim: 12
+
+  # 指导强度
+  guidance_strength:
+    initial: 0.1
+    final: 0.5
+    ramp_up_generations: 5000
+```
+
+### 7.2 训练参数
+
+```yaml
+training:
+  # 基础参数
+  batch_size: 16
+  max_generations: 50000
+
+  # 学习率
+  learning_rates:
+    generator: 0.0002
+    discriminator: 0.0002
+    demiurge: 0.0001
+
+  # 优化器
+  optimizer: 'Adam'
+  adam_betas: [0.5, 0.999]
+
+  # 损失函数
+  loss_type: 'wgan-gp'  # 或 'bce'
+  gradient_penalty_lambda: 10
+
+  # 正则化
+  factor_regularization_weight: 0.01
+
+  # 训练阶段
+  dormant_period: [1, 9999]
+  awakening_generation: 10000  # 或基于指标自动触发
+```
+
+### 7.3 指标计算参数
+
+```yaml
+metrics:
+  # 世界稳定性
+  stability:
+    variance_max: 2.0  # 归一化范围
+
+  # 永劫回归检测
+  eternal_return:
+    window_size: 20
+    threshold: 0.95
+
+  # 趋势计算
+  trend:
+    window_size: 100
+    ewma_alpha: 0.1
+
+  # 德谬歌准确度
+  demiurge_accuracy:
+    rolling_window: 100
+
+  # 铁墓诞生检测
+  tiemu_birth:
+    erosion_threshold: 0.9
+    duration: 100
+```
+
+### 7.4 事件触发阈值
+
+```yaml
+events:
+  # 黑潮相关
+  black_tide:
+    first_outbreak: 0.7
+    severe_erosion: 0.85
+    weakening: 0.3
+
+  # 世界稳定性
+  stability:
+    collapse_warning: 0.15
+    highly_stable: 0.7
+
+  # 永劫回归
+  eternal_return:
+    detection_threshold: 0.95
+
+  # 德谬歌相关
+  demiurge:
+    learning_milestone: 0.8
+    awakening_accuracy: 0.9
+    awakening_erosion: 0.75
+    awakening_min_generation: 5000
+    influence_strong: 0.5
+
+  # 终极事件
+  ultimate:
+    tiemu_birth_erosion: 0.95
+    tiemu_birth_stability: 0.05
+    life_breakthrough_stability: 0.8
+    life_breakthrough_erosion: 0.3
+```
+
+### 7.5 可视化参数
+
+```yaml
+visualization:
+  # 世界图像
+  world_image:
+    size: [64, 64]
+    value_range: [-1, 1]
+    display_size: [512, 512]  # 放大显示
+
+  # 黑潮效果
+  black_tide_color: [0, 0, 0]  # 黑色
+
+  # 德谬歌效果
+  demiurge_color: [1.0, 0.84, 0.0]  # 金色 RGB
+
+  # 更新频率
+  update_frequency: 10  # 每10个世代更新一次
+
+  # TensorBoard
+  tensorboard_log_frequency: 1
+```
+
+### 7.6 检查点和保存
+
+```yaml
+checkpointing:
+  # 保存频率
+  save_frequency: 1000  # 每1000世代保存一次
+
+  # 保存内容
+  save_components:
+    - generator
+    - discriminator
+    - demiurge
+    - optimizers
+    - metrics_history
+    - event_log
+
+  # 保存路径
+  checkpoint_dir: 'experiments/checkpoints'
+
+  # 最大保存数量
+  max_checkpoints: 10  # 只保留最近10个检查点
+```
+
+## 8. 技术栈
 
 ### 7.1 核心框架
 - PyTorch：深度学习框架
