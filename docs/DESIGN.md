@@ -280,21 +280,14 @@ for generation in range(1, 10000):
     # 6. 判别器判断
     erosion = Discriminator(world)  # [batch, 1, 64, 64]
 
-    # 7. 德谬歌观察并学习（独立训练）
-    predicted_world = Demiurge.observe_and_learn(
+    # 7. 德谬歌观察并学习（自编码器式重构）
+    demiurge_loss, demiurge_metrics = demiurge_loss(
+        Demiurge,
         world.detach(),
         factor_activities
     )
 
-    # 8. 德谬歌的学习损失（预测下一个世界）
-    next_world_noise = random_noise()
-    next_factor_outputs = [factor_i(next_world_noise) for i in range(12)]
-    next_world_new = FusionLayer(next_factor_outputs)
-    next_world = 0.7 * next_world_new + 0.3 * world.detach()
-
-    demiurge_loss = F.mse_loss(predicted_world, next_world.detach())
-
-    # 9. 训练德谬歌（不影响G/D）
+    # 8. 训练德谬歌（不影响G/D）
     demiurge_optimizer.zero_grad()
     demiurge_loss.backward()
     demiurge_optimizer.step()
@@ -420,12 +413,151 @@ def discriminator_loss(D, real_world, fake_world):
 
 **注意**：
 - 在本项目中，我们没有"真实世界"数据集
-- 可以使用以下策略之一：
-  - **策略A**：判别器只判断生成世界，目标是最大化侵蚀度
-  - **策略B**：使用预定义的"理想世界"模板作为真实数据
-  - **策略C**：使用WGAN-GP损失（推荐）
+- 使用**自适应真实数据生成策略**自动解决这个问题
 
-**推荐：WGAN-GP损失**
+#### 自适应真实数据生成策略
+
+**核心思路**：使用生成器自己生成的"高质量世界"作为真实数据
+
+```python
+class AdaptiveRealDataBuffer:
+    """自适应真实数据缓冲区"""
+
+    def __init__(self, buffer_size=1000, quality_threshold=0.7):
+        """
+        Args:
+            buffer_size: 缓冲区大小
+            quality_threshold: 质量阈值（稳定性 > threshold 才加入缓冲区）
+        """
+        self.buffer = []
+        self.buffer_size = buffer_size
+        self.quality_threshold = quality_threshold
+
+    def add(self, world, stability):
+        """添加高质量世界到缓冲区"""
+        if stability > self.quality_threshold:
+            self.buffer.append(world.detach().cpu())
+
+            # 保持缓冲区大小
+            if len(self.buffer) > self.buffer_size:
+                self.buffer.pop(0)  # 移除最旧的
+
+    def sample(self, batch_size, device):
+        """从缓冲区采样"""
+        if len(self.buffer) == 0:
+            # 缓冲区为空时，返回None（使用初始策略）
+            return None
+
+        # 随机采样
+        indices = torch.randint(0, len(self.buffer), (batch_size,))
+        samples = [self.buffer[i] for i in indices]
+        return torch.stack(samples).to(device)
+
+    def is_ready(self):
+        """缓冲区是否准备好"""
+        return len(self.buffer) >= self.buffer_size // 2  # 至少有一半满
+```
+
+**自适应判别器损失**：
+
+```python
+def adaptive_discriminator_loss(D, fake_world, stability, real_buffer,
+                                use_wgan=True, lambda_gp=10):
+    """
+    自适应判别器损失
+
+    Args:
+        D: 判别器
+        fake_world: 生成的世界
+        stability: 当前世界的稳定性
+        real_buffer: 真实数据缓冲区
+        use_wgan: 是否使用WGAN-GP（默认True）
+        lambda_gp: 梯度惩罚系数
+
+    Returns:
+        loss: 判别器损失
+    """
+    batch_size = fake_world.size(0)
+    device = fake_world.device
+
+    # 1. 尝试从缓冲区获取真实数据
+    real_world = real_buffer.sample(batch_size, device)
+
+    # 2. 如果缓冲区为空，使用初始策略
+    if real_world is None:
+        # 初始阶段：使用简单的目标分布
+        # 创建"理想世界"：均匀分布的彩色图案
+        real_world = create_ideal_world_template(batch_size, device)
+
+    # 3. 计算损失
+    if use_wgan:
+        loss = discriminator_loss_wgan_gp(D, real_world, fake_world, lambda_gp)
+    else:
+        loss = discriminator_loss_bce(D, real_world, fake_world)
+
+    # 4. 将高质量的生成世界加入缓冲区
+    real_buffer.add(fake_world, stability)
+
+    return loss
+
+
+def create_ideal_world_template(batch_size, device):
+    """
+    创建理想世界模板（初始阶段使用）
+
+    Returns:
+        ideal_world: [batch, 3, 64, 64]
+    """
+    # 策略1：均匀分布的彩色图案
+    ideal_world = torch.rand(batch_size, 3, 64, 64, device=device) * 2 - 1
+
+    # 策略2：添加一些结构（渐变）
+    x = torch.linspace(-1, 1, 64, device=device)
+    y = torch.linspace(-1, 1, 64, device=device)
+    xx, yy = torch.meshgrid(x, y, indexing='ij')
+
+    # 创建渐变模式
+    gradient = torch.stack([xx, yy, (xx + yy) / 2], dim=0)  # [3, 64, 64]
+    gradient = gradient.unsqueeze(0).repeat(batch_size, 1, 1, 1)  # [batch, 3, 64, 64]
+
+    # 混合随机和渐变
+    ideal_world = 0.7 * ideal_world + 0.3 * gradient
+
+    return ideal_world
+```
+
+**使用方式**：
+
+```python
+# 初始化缓冲区
+real_buffer = AdaptiveRealDataBuffer(
+    buffer_size=1000,
+    quality_threshold=0.7
+)
+
+# 训练循环中
+for generation in range(1, max_generations):
+    # ... 生成世界 ...
+
+    # 计算稳定性
+    stability = calculate_stability(world)
+
+    # 自适应判别器训练
+    D_loss = adaptive_discriminator_loss(
+        D, world, stability, real_buffer,
+        use_wgan=True, lambda_gp=10
+    )
+
+    # ... 其他训练步骤 ...
+```
+
+**优势**：
+- ✅ 自动解决真实数据缺失问题
+- ✅ 初期使用理想模板，后期使用自己生成的高质量数据
+- ✅ 形成正反馈：生成器越好 → 缓冲区质量越高 → 判别器越强 → 生成器更好
+- ✅ 无需手工设计真实数据
+
+**推荐：WGAN-GP损失（保持不变）**
 
 ```python
 def discriminator_loss_wgan_gp(D, real_world, fake_world, lambda_gp=10):
@@ -504,30 +636,85 @@ def generator_loss_wgan(D, fake_world):
 
 #### 德谬歌损失（沉睡期）
 
+**核心理念**：德谬歌学习"记忆和重构"，而非"预测未来"
+
 ```python
-def demiurge_loss(Demiurge, current_world, factor_activities, next_world):
+def demiurge_loss(Demiurge, current_world, factor_activities):
     """
-    德谬歌的自监督学习损失
+    德谬歌的自监督学习损失（自编码器式）
+
+    核心思路：
+    - 德谬歌学习如何通过"记忆"重构当前世界
+    - 而不是预测下一个世界（那是在学习生成器的随机性）
+    - 这更符合"记忆"的设定
 
     Args:
         Demiurge: 德谬歌网络
-        current_world: 当前世界状态
-        factor_activities: 12因子活跃度
-        next_world: 下一个世界状态（真实值）
+        current_world: 当前世界状态 [batch, 3, 64, 64]
+        factor_activities: 12因子活跃度 [batch, 12]
 
     Returns:
-        loss: 预测损失
+        loss: 重构损失
     """
-    # 预测下一个世界
-    predicted_world = Demiurge.predict(
-        current_world.detach(),
-        factor_activities.detach()
-    )
+    # 1. 编码：世界 + 因子活跃度 → 记忆特征
+    world_features = Demiurge.world_encoder(current_world.detach())  # [batch, 256]
+    factor_features = Demiurge.factor_encoder(factor_activities.detach())  # [batch, 64]
 
-    # MSE损失
-    loss = F.mse_loss(predicted_world, next_world.detach())
+    # 2. 记忆模块：LSTM处理
+    combined_features = torch.cat([world_features, factor_features], dim=1)  # [batch, 320]
+    memory_state, _ = Demiurge.memory(combined_features.unsqueeze(0))  # [1, batch, 512]
+    memory_state = memory_state.squeeze(0)  # [batch, 512]
 
-    return loss
+    # 3. 重构：从记忆中重构世界
+    reconstructed_world = Demiurge.predictor(memory_state)  # [batch, 12288]
+    reconstructed_world = reconstructed_world.view(-1, 3, 64, 64)  # [batch, 3, 64, 64]
+
+    # 4. 重构损失（MSE）
+    reconstruction_loss = F.mse_loss(reconstructed_world, current_world.detach())
+
+    # 5. 可选：添加因子活跃度预测损失（辅助任务）
+    # 这帮助德谬歌理解"哪些因子导致了当前世界"
+    predicted_activities = Demiurge.factor_predictor(memory_state)  # [batch, 12]
+    activity_loss = F.mse_loss(predicted_activities, factor_activities.detach())
+
+    # 总损失
+    total_loss = reconstruction_loss + 0.1 * activity_loss
+
+    return total_loss, {
+        'reconstruction_loss': reconstruction_loss.item(),
+        'activity_loss': activity_loss.item()
+    }
+```
+
+**为什么这样设计**：
+
+1. **重构任务 vs 预测任务**：
+   - ❌ 预测下一世界：学习生成器的随机性（无意义）
+   - ✅ 重构当前世界：学习世界的本质特征（有意义）
+
+2. **符合"记忆"设定**：
+   - 德谬歌通过"记忆"理解世界
+   - 重构任务强迫德谬歌记住世界的关键特征
+   - 苏醒后，这些记忆用于指导12因子
+
+3. **辅助任务**：
+   - 预测因子活跃度帮助德谬歌理解"因果关系"
+   - 哪些因子组合产生了当前世界
+
+**网络结构补充**：
+
+```python
+class Demiurge(nn.Module):
+    def __init__(self):
+        # ... 原有结构 ...
+
+        # 新增：因子活跃度预测器（辅助任务）
+        self.factor_predictor = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Linear(128, 12),
+            nn.Sigmoid()  # 输出 [0, 1]
+        )
 ```
 
 #### 12因子的正则化损失
@@ -1133,6 +1320,84 @@ generator:
   memory_fusion:
     new_weight: 0.7
     old_weight: 0.3
+
+  # 12因子正则化配置
+  factor_regularization:
+    # 命运三泰坦
+    - name: "雅努斯"
+      index: 0
+      regularization: "L2"
+      reg_weight: 0.01
+      description: "平滑过渡，L2正则化"
+
+    - name: "塔兰顿"
+      index: 1
+      regularization: "L1"
+      reg_weight: 0.01
+      description: "结构化，L1稀疏约束"
+
+    - name: "欧洛尼斯"
+      index: 2
+      regularization: "none"
+      reg_weight: 0.0
+      description: "历史依赖，无正则化"
+
+    # 支柱三泰坦
+    - name: "吉奥里亚"
+      index: 3
+      regularization: "variance_min"
+      reg_weight: 0.02
+      description: "稳定性，最小化方差"
+
+    - name: "法吉娜"
+      index: 4
+      regularization: "sparsity"
+      reg_weight: 0.015
+      description: "虚无，稀疏性约束"
+
+    - name: "艾格勒"
+      index: 5
+      regularization: "L2"
+      reg_weight: 0.01
+      description: "保护性，L2正则化"
+
+    # 创生三泰坦
+    - name: "刻法勒"
+      index: 6
+      regularization: "none"
+      reg_weight: 0.0
+      description: "光明，无约束"
+
+    - name: "瑟希斯"
+      index: 7
+      regularization: "L2"
+      reg_weight: 0.005
+      description: "复杂性，轻度L2"
+
+    - name: "墨涅塔"
+      index: 8
+      regularization: "negative_L2"
+      reg_weight: -0.01
+      description: "过拟合，负L2鼓励大值"
+
+    # 灾厄三泰坦
+    - name: "尼卡多利"
+      index: 9
+      regularization: "L1"
+      reg_weight: 0.02
+      description: "边界明确，L1约束"
+
+    - name: "塞纳托斯"
+      index: 10
+      regularization: "none"
+      reg_weight: 0.0
+      description: "循环重生，无约束"
+
+    - name: "扎格列斯"
+      index: 11
+      regularization: "variance_max"
+      reg_weight: -0.015
+      description: "极端化，最大化方差"
 ```
 
 #### 判别器（黑潮）
