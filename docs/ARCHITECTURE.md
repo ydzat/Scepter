@@ -268,25 +268,36 @@ Discriminator (Black Tide)
 ├── Input: [batch, 3, 64, 64]
 │
 ├── Encoder (CNN)
-│   ├── Conv2d: [3 → 32, 64x64 → 32x32]
+│   ├── Conv2d: [3 → 64, kernel=4, stride=2, padding=1]  # 64x64 → 32x32
 │   ├── LeakyReLU(0.2)
-│   ├── Conv2d: [32 → 64, 32x32 → 16x16]
+│   ├── Conv2d: [64 → 128, kernel=4, stride=2, padding=1]  # 32x32 → 16x16
 │   ├── BatchNorm + LeakyReLU(0.2)
-│   ├── Conv2d: [64 → 128, 16x16 → 8x8]
+│   ├── Conv2d: [128 → 256, kernel=4, stride=2, padding=1]  # 16x16 → 8x8
 │   ├── BatchNorm + LeakyReLU(0.2)
-│   ├── Conv2d: [128 → 256, 8x8 → 4x4]
-│   ├── BatchNorm + LeakyReLU(0.2)
-│   └── Flatten: [batch, 256*4*4]
+│   ├── Conv2d: [256 → 512, kernel=4, stride=2, padding=1]  # 8x8 → 4x4
+│   └── BatchNorm + LeakyReLU(0.2)
 │
-├── Classifier
-│   ├── FC: [256*4*4 → 512]
+├── Spatial Output Layer
+│   ├── ConvTranspose2d: [512 → 256, kernel=4, stride=2, padding=1]  # 4x4 → 8x8
 │   ├── LeakyReLU(0.2)
-│   ├── Dropout(0.3)
-│   ├── FC: [512 → 1]
+│   ├── ConvTranspose2d: [256 → 128, kernel=4, stride=2, padding=1]  # 8x8 → 16x16
+│   ├── LeakyReLU(0.2)
+│   ├── ConvTranspose2d: [128 → 64, kernel=4, stride=2, padding=1]  # 16x16 → 32x32
+│   ├── LeakyReLU(0.2)
+│   ├── ConvTranspose2d: [64 → 1, kernel=4, stride=2, padding=1]  # 32x32 → 64x64
 │   └── Sigmoid (输出范围 [0, 1])
 │
-└── Output: Erosion Score (黑潮侵蚀度)
+└── Output: [batch, 1, 64, 64] 空间侵蚀图
+    ├── 每个像素表示该位置的侵蚀强度
+    ├── 全局侵蚀度 = 空间侵蚀图的平均值
+    └── 用于可视化黑潮效果
 ```
+
+**说明**：
+- 判别器输出空间侵蚀图，而非单一标量
+- 通过编码器-解码器结构保留空间信息
+- 全局侵蚀度通过 `.mean()` 计算
+- 空间侵蚀图用于后处理中的黑潮可视化
 
 ### 2.3 观察者架构（德谬歌）
 
